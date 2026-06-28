@@ -37,30 +37,13 @@ def _ensure_tokenizer(model_path: str):
 
 
 def _load_dataloader(tokenizer, cfg: EvalConfig):
-    """Return a small validation DataLoader."""
-    from datasets import Dataset
+    """Return a small validation DataLoader from wikitext-103-raw."""
     from torch.utils.data import DataLoader
-    from .train import WikiTextStream, _collate
+    from .train import TextStream, _collate, _ensure_wikitext
 
-    cache = "/Volumes/Samsung/huggingface/datasets/wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3"
-    ds = Dataset.from_file(f"{cache}/wikitext-test.arrow")
-    texts = [ex["text"] for ex in ds]
+    _, valid_texts = _ensure_wikitext()
 
-    class _Iter:
-        def __init__(self, lst):
-            self.lst = lst
-            self.idx = 0
-        def __iter__(self):
-            self.idx = 0
-            return self
-        def __next__(self):
-            if self.idx >= len(self.lst):
-                raise StopIteration
-            v = {"text": self.lst[self.idx]}
-            self.idx += 1
-            return v
-
-    stream = WikiTextStream(_Iter(texts), tokenizer, cfg.context_len, cfg.num_drafts)
+    stream = TextStream(valid_texts, tokenizer, cfg.context_len, cfg.num_drafts)
     return DataLoader(stream, batch_size=cfg.batch_size, collate_fn=_collate)
 
 

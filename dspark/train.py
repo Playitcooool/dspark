@@ -51,18 +51,114 @@ class TrainConfig:
 
 # ═══════════════════════════════════════════════════════════════ data
 
+WIKITEXT_CACHE = os.path.expanduser("~/.cache/dspark/wikitext-103-raw")
 
-class WikiTextStream(IterableDataset):
-    """Stream wikitext chunks from a pre-tokenized iterable dataset.
+# Local data dir (project-relative) checked first
+_LOCAL_DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 
-    Yields dicts:
-      input_ids: (T,)  — context tokens
-      labels:    (T+N,) — full sequence (context + N draft targets)
+
+def _ensure_wikitext() -> tuple[list[str], list[str]]:
+    """Load wikitext-103-raw parquet files.
+
+    Checks in order:
+      1. ``data/`` (project-relative) for raw shard files
+      2. ``~/.cache/dspark/wikitext-103-raw/`` for merged parquet files
+      3. Downloads from HF Hub (via HF_ENDPOINT) if neither found
+
+    Returns (train_texts, valid_texts) — lists of article strings.
     """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    def __init__(self, ds_iter, tokenizer, context_len: int,
+    train_path = os.path.join(WIKITEXT_CACHE, "train.parquet")
+    valid_path = os.path.join(WIKITEXT_CACHE, "validation.parquet")
+
+    # ── 1. Check project-local data/ ────────────────────────────────────────
+    local_shards = sorted([
+        os.path.join(_LOCAL_DATA, f)
+        for f in os.listdir(_LOCAL_DATA)
+        if f.startswith("train-") and f.endswith(".parquet")
+    ]) if os.path.isdir(_LOCAL_DATA) else []
+    local_valid = (
+        os.path.join(_LOCAL_DATA, "validation-00000-of-00001.parquet")
+        if os.path.isdir(_LOCAL_DATA) and os.path.exists(
+            os.path.join(_LOCAL_DATA, "validation-00000-of-00001.parquet"))
+        else None
+    )
+    if local_shards and local_valid:
+        print(f"  found {len(local_shards)} train shard(s) + validation in data/")
+        os.makedirs(WIKITEXT_CACHE, exist_ok=True)
+        tables = [pq.read_table(s) for s in local_shards]
+        pq.write_table(pa.concat_tables(tables), train_path)
+        import shutil
+        shutil.copy2(local_valid, valid_path)
+
+    # ── 2. Download if still missing ────────────────────────────────────────
+    if not (os.path.exists(train_path) and os.path.exists(valid_path)):
+        os.makedirs(WIKITEXT_CACHE, exist_ok=True)
+
+        # Try HF mirror first (faster in CN); override with HF_ENDPOINT env var
+        endpoint = os.environ.get("HF_ENDPOINT",
+                                  "https://hf-mirror.com")
+        tmpdir = os.path.join(WIKITEXT_CACHE, ".dl")
+        os.makedirs(tmpdir, exist_ok=True)
+        shards = [
+            ("wikitext-103-raw-v1/train-00000-of-00002.parquet",
+             os.path.join(tmpdir, "train-00.parquet")),
+            ("wikitext-103-raw-v1/train-00001-of-00002.parquet",
+             os.path.join(tmpdir, "train-01.parquet")),
+            ("wikitext-103-raw-v1/validation-00000-of-00001.parquet",
+             os.path.join(tmpdir, "valid.parquet")),
+        ]
+        import subprocess, shutil
+        for src, dst in shards:
+            if os.path.exists(dst):
+                print(f"  {src} already cached")
+                continue
+            url = f"{endpoint}/datasets/wikitext/resolve/main/{src}"
+            print(f"  downloading {src} …")
+            subprocess.run(
+                ["wget", "-c", "-t", "10", "--timeout=60", "-O", dst, url],
+                check=True, capture_output=True)
+            sz = os.path.getsize(dst)
+            print(f"    -> {sz / 1e6:.1f} MB")
+
+        # Merge train shards
+        import pyarrow.parquet as pq
+        t1 = pq.read_table(os.path.join(tmpdir, "train-00.parquet"))
+        t2 = pq.read_table(os.path.join(tmpdir, "train-01.parquet"))
+        pq.write_table(pa.concat_tables([t1, t2]), train_path)
+        os.rename(os.path.join(tmpdir, "valid.parquet"), valid_path)
+        shutil.rmtree(tmpdir)
+
+    def _load_articles(path: str) -> list[str]:
+        table = pq.read_table(path, columns=["text"])
+        texts = table.column("text").to_pylist()
+        articles, buf = [], []
+        for t in texts:
+            if t is None:
+                continue
+            t = t.strip()
+            if t.startswith(" ="):
+                if buf:
+                    articles.append("".join(buf))
+                    buf = []
+                continue
+            if t:
+                buf.append(t + "\n")
+        if buf:
+            articles.append("".join(buf))
+        return articles
+
+    return _load_articles(train_path), _load_articles(valid_path)
+
+
+class TextStream(IterableDataset):
+    """Stream text chunks from a list of strings."""
+
+    def __init__(self, texts, tokenizer, context_len: int,
                  num_drafts: int):
-        self.ds_iter = ds_iter
+        self.texts = texts
         self.tokenizer = tokenizer
         self.context_len = context_len
         self.full_len = context_len + num_drafts  # T+N
@@ -70,8 +166,7 @@ class WikiTextStream(IterableDataset):
 
     def __iter__(self):
         acc = self._buffer.copy()
-        for example in self.ds_iter:
-            text = example["text"]
+        for text in self.texts:
             ids = self.tokenizer.encode(text, add_special_tokens=False)
             acc.extend(ids)
             while len(acc) >= self.full_len:
@@ -83,41 +178,17 @@ class WikiTextStream(IterableDataset):
 
 
 def get_dataloaders(tokenizer, cfg: TrainConfig):
-    """Return (train_loader, valid_loader)."""
-    from datasets import Dataset, load_from_disk
+    """Return (train_loader, valid_loader) from wikitext-103-raw."""
+    print("Loading wikitext-103-raw …")
+    train_texts, valid_texts = _ensure_wikitext()
+    print(f"  train: {len(train_texts)} articles,  valid: {len(valid_texts)} articles")
 
-    # Load from local cache path
-    train_path = os.path.join(cfg.data_cache, "wikitext-train.arrow")
-    valid_path = os.path.join(cfg.data_cache, "wikitext-validation.arrow")
-    train_ds = Dataset.from_file(train_path)
-    valid_ds = Dataset.from_file(valid_path)
-
-    all_text = [ex["text"] for ex in train_ds]
-    valid_text = [ex["text"] for ex in valid_ds]
-
-    def _make_loader(texts, shuffle: bool):
-        class _ListIter:
-            def __init__(self, lst):
-                self.lst = lst
-                self.idx = 0
-            def __iter__(self):
-                self.idx = 0
-                return self
-            def __next__(self):
-                if self.idx >= len(self.lst):
-                    raise StopIteration
-                val = {"text": self.lst[self.idx]}
-                self.idx += 1
-                return val
-
-        ds = WikiTextStream(
-            _ListIter(texts), tokenizer,
-            cfg.context_len, cfg.num_drafts,
-        )
+    def _make_loader(texts):
+        ds = TextStream(texts, tokenizer, cfg.context_len, cfg.num_drafts)
         return DataLoader(ds, batch_size=cfg.batch_size,
                           collate_fn=_collate)
 
-    return _make_loader(all_text, shuffle=False), _make_loader(valid_text, shuffle=False)
+    return _make_loader(train_texts), _make_loader(valid_texts)
 
 
 def _collate(batch):

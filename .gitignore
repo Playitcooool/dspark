@@ -4,3 +4,4 @@ checkpoints/
 *.pt
 *.arrow
 .DS_Store
+data/
