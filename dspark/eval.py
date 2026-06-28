@@ -17,6 +17,7 @@ class EvalConfig:
     model_path: str = "/Volumes/Samsung/lmstudio/lmstudio-community/Qwen:Qwen3.5-0.8B/"
     checkpoint: str = ""  # empty = untrained heads
     num_drafts: int = 5
+    num_diff_steps: int = 8
     context_len: int = 512
     batch_size: int = 4
     num_batches: int = 20          # how many batches for perplexity eval
@@ -293,6 +294,7 @@ def main():
     cfg = EvalConfig()
     print("Loading model …")
     model = DSparkModel(cfg.model_path, num_drafts=cfg.num_drafts)
+    model.num_diff_steps = cfg.num_diff_steps
     if cfg.checkpoint:
         ckpt = torch.load(cfg.checkpoint, map_location="mps")
         model.load_state_dict(ckpt["model_state"], strict=False)

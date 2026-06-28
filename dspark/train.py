@@ -218,8 +218,8 @@ class Trainer:
         torch.save({
             "step": self.step,
             "model_state": {k: v for k, v in self.model.state_dict().items()
-                           if k.startswith(("draft_heads.", "markov_head.",
-                                           "confidence_head."))},
+                           if k.startswith(("diff_draft_head.", "time_proj.",
+                                           "markov_head.", "confidence_head."))},
             "opt_state": self.opt.state_dict(),
             "scheduler": self.scheduler.state_dict(),
         }, path)
@@ -383,6 +383,7 @@ def main():
 
     print("Building model …")
     model = DSparkModel(cfg.model_path, num_drafts=cfg.num_drafts)
+    model.num_diff_steps = cfg.num_diff_steps
     model.print_summary()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")

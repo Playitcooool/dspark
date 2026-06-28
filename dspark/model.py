@@ -402,5 +402,5 @@ class DSparkModel(nn.Module):
               f"trainable:{trainable/1e6:.1f}M  "
               f"frozen:{frozen/1e6:.1f}M")
         print(f"  DiffDraftHead:  {self.hidden_size}→{self.hidden_size*4}→{self.hidden_size} (shared MLP)")
-        print(f"  MarkovHead:  {self.hidden_size}×2→{self.hidden_size}→V")
+        print(f"  MarkovHead:  {self.hidden_size}×2→{self.hidden_size} (hidden-space bias)")
         print(f"  Confidence:  {self.hidden_size}→128→{self.num_drafts} sigmoid")
