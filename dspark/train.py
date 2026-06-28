@@ -291,6 +291,9 @@ class Trainer:
     def train(self, train_loader, valid_loader):
         self.model.train()
         t0 = time.time()
+        from tqdm import tqdm
+        pbar = tqdm(total=self.cfg.max_steps, desc="train", unit="step",
+                    bar_format="{l_bar}{bar:10}{r_bar}")
 
         while self.step < self.cfg.max_steps:
             for batch in train_loader:
@@ -310,18 +313,20 @@ class Trainer:
                     self.scheduler.step()
                     self.opt.zero_grad()
 
-                # -- logging --------------------------------------------------
-                if self.step % self.cfg.log_every == 0:
-                    elapsed = time.time() - t0
-                    tok_per_sec = (self.step * self.cfg.batch_size *
-                                   (self.cfg.context_len + self.cfg.num_drafts) / elapsed)
-                    lr = self.scheduler.get_last_lr()[0]
-                    print(
-                        f"step {self.step:>5d} | loss {stats['loss']:.4f} "
-                        f"ce {stats['ce_loss']:.4f} conf {stats['conf_loss']:.4f} "
-                        f"accept {stats['accept_rate']:.3f} ppl {stats['ppl']:.1f} "
-                        f"lr {lr:.2e} t/s {tok_per_sec:.0f}"
-                    )
+                # -- progress bar ----------------------------------------------
+                elapsed = time.time() - t0
+                tok_per_sec = ((self.step + 1) * self.cfg.batch_size *
+                               (self.cfg.context_len + self.cfg.num_drafts) /
+                               max(elapsed, 1))
+                pbar.set_postfix(
+                    loss=f"{stats['loss']:.3f}",
+                    ce=f"{stats['ce_loss']:.2f}",
+                    conf=f"{stats['conf_loss']:.3f}",
+                    accept=f"{stats['accept_rate']:.2f}",
+                    ppl=f"{stats['ppl']:.0f}",
+                    tok_s=f"{tok_per_sec:.0f}",
+                )
+                pbar.update(1)
 
                 # -- validation -----------------------------------------------
                 if self.step > 0 and self.step % self.cfg.valid_every == 0:
@@ -334,6 +339,7 @@ class Trainer:
 
                 self.step += 1
 
+        pbar.close()
         # Final save
         self._save(os.path.join(self.cfg.output_dir, "dspark_final.pt"))
 
