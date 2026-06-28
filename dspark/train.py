@@ -270,7 +270,25 @@ class Trainer:
 
     @torch.no_grad()
     def valid_step(self, batch) -> dict[str, float]:
-        return self.train_step(batch)  # same computation, no gradients
+        input_ids = batch["input_ids"].to(self.device)
+        labels = batch["labels"].to(self.device)
+        out = self.model(input_ids, labels=labels)
+        N = self.cfg.num_drafts
+        T = input_ids.shape[1]
+        targets = labels[:, T:T + N]
+        ce_loss = F.cross_entropy(
+            out["logits"].reshape(-1, out["logits"].size(-1)),
+            targets.reshape(-1),
+        )
+        conf_loss = F.binary_cross_entropy(
+            out["accept_probs"].float(),
+            out["accept_targets"].float(),
+        )
+        loss = self.cfg.ce_weight * ce_loss + self.cfg.confidence_weight * conf_loss
+        acc = out["accept_targets"].float().mean().item()
+        ppl = math.exp(min(ce_loss.item(), 20))
+        return dict(loss=loss.item(), ce_loss=ce_loss.item(),
+                    conf_loss=conf_loss.item(), accept_rate=acc, ppl=ppl)
 
     # ── full epochs ──────────────────────────────────────────────────────────
 
