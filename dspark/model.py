@@ -79,23 +79,26 @@ class TimeProjection(nn.Module):
         return self.mlp(self.embed(t))  # (B, H)
 
 
-class DraftHeads(nn.Module):
-    """N parallel draft heads with a shared vocab projection (tied to lm_head)."""
+class DiffDraftHead(nn.Module):
+    """Per-position denoiser MLP for discrete token diffusion.
 
-    def __init__(self, hidden_size: int, num_drafts: int):
+    Given noisy token embeddings + conditioning h_T + timestep encoding,
+    predicts the clean hidden state at each draft position.
+    """
+    def __init__(self, hidden_size: int, expansion: int = 4):
         super().__init__()
-        # Per-head adapters: tiny SiLU-activated bottlenecks
-        self.adapters = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_size, hidden_size, bias=False),
-                nn.SiLU(),
-            )
-            for _ in range(num_drafts)
-        ])
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * expansion, bias=False),
+            nn.SiLU(),
+            nn.Linear(hidden_size * expansion, hidden_size, bias=False),
+        )
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """(B, H) → (B, N, H)  after per-head adaptation."""
-        return torch.stack([a(hidden) for a in self.adapters], dim=1)
+    def forward(self, noisy_embed: torch.Tensor, h_T: torch.Tensor,
+                t_enc: torch.Tensor) -> torch.Tensor:
+        """(B,N,H), (B,H), (B,H) → (B,N,H) clean hidden states."""
+        x = noisy_embed + h_T.unsqueeze(1) + t_enc.unsqueeze(1)
+        return self.net(x)
 
 
 class MarkovHead(nn.Module):
