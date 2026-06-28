@@ -1,14 +1,16 @@
-"""DSpark: Parallel draft model with Markov head and confidence head.
+"""DSpark: Diffusion-based draft model with Markov head and confidence head.
 
 Architecture (inference flow):
   1. Frozen base model produces last-token hidden state  (B, H)
-  2. N parallel DraftHeads predict lookahead tokens       (B, N, V_logits)
+  2. DDIM sampling loop (K=8 steps) denoises random tokens
+     using the DiffDraftHead denoiser MLP
   3. Greedy-decode step 2 tokens → MarkovHead computes
      transition bias from adjacent (prev, cur) pairs      (B, N, V_bias)
-  4. Final logits = draft_logits + markov_bias            (B, N, V)
+  4. Final logits = clean_logits + markov_bias            (B, N, V)
   5. ConfidenceHead predicts P(accept_k) per position     (B, N)
 
-Training uses ground-truth labels for the Markov bias pairs.
+Training uses ground-truth labels for the Markov bias pairs and corrupts
+them with a cosine noise schedule for the diffusion denoiser.
 """
 
 from __future__ import annotations
@@ -334,8 +336,10 @@ class DSparkModel(nn.Module):
         # -- DDIM sampling loop ------------------------------------------------
         K = self.num_diff_steps
         device = input_ids.device
-        B = input_ids.shape[0]
-        N = self.num_drafts
+
+        # Default in case loop never runs (K=0)
+        draft_tokens = torch.empty(B, N, dtype=torch.long, device=device)
+        final_logits = torch.empty(B, N, self.vocab_size, device=device)
 
         # 1. Pick K evenly-spaced noise levels (1000 -> 1)
         steps = torch.linspace(1000, 1, K + 1, device=device,
@@ -369,7 +373,8 @@ class DSparkModel(nn.Module):
 
             # f. DDIM step (except the last -- use final as output)
             if i < K - 1:
-                p0 = F.softmax(logits_i.float(), dim=-1)
+                temp = max(temperature, 1e-8)
+                p0 = F.softmax(logits_i.float() / temp, dim=-1)
                 a_next = alphas[i + 1]
                 next_dist = a_next * p0 + (1.0 - a_next) / self.vocab_size
                 tokens = torch.multinomial(
