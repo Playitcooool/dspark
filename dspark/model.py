@@ -148,6 +148,7 @@ class DSparkModel(nn.Module):
     def __init__(self, base_model_name: str, num_drafts: int = 5):
         super().__init__()
         self.num_drafts = num_drafts
+        self.num_diff_steps = 8  # DDIM steps at inference
 
         # -- frozen base model -------------------------------------------------
         dtype = torch.bfloat16
@@ -175,12 +176,11 @@ class DSparkModel(nn.Module):
 
         # -- trainable heads (same dtype as base model to avoid MPS mixed-dtype) -
         head_dtype = dtype
-        self.draft_heads = DraftHeads(self.hidden_size, num_drafts)
-        self.draft_heads.to(head_dtype)
-        self.markov_head = MarkovHead(self.hidden_size)
-        self.markov_head.to(head_dtype)
-        self.confidence_head = ConfidenceHead(self.hidden_size, num_drafts)
-        self.confidence_head.to(head_dtype)
+        self.noise_schedule = NoiseSchedule(T=1000, s=0.008)
+        self.time_proj = TimeProjection(self.hidden_size).to(head_dtype)
+        self.diff_draft_head = DiffDraftHead(self.hidden_size, expansion=4).to(head_dtype)
+        self.markov_head = MarkovHead(self.hidden_size).to(head_dtype)
+        self.confidence_head = ConfidenceHead(self.hidden_size, num_drafts).to(head_dtype)
 
     # ── public helpers ────────────────────────────────────────────────────────
 
@@ -191,8 +191,8 @@ class DSparkModel(nn.Module):
     def trainable_parameters(self) -> list[nn.Parameter]:
         """Return all parameters that should receive gradients."""
         params = []
-        for a in self.draft_heads.adapters:
-            params.extend(a.parameters())
+        params.extend(self.diff_draft_head.parameters())
+        params.extend(self.time_proj.parameters())
         params.extend(self.markov_head.parameters())
         params.extend(self.confidence_head.parameters())
         return params
@@ -352,6 +352,6 @@ class DSparkModel(nn.Module):
         print(f"DSparkModel  total:{total/1e6:.1f}M  "
               f"trainable:{trainable/1e6:.1f}M  "
               f"frozen:{frozen/1e6:.1f}M")
-        print(f"  DraftHeads:  {self.num_drafts}× {self.hidden_size}→{self.hidden_size}")
+        print(f"  DiffDraftHead:  {self.hidden_size}→{self.hidden_size*4}→{self.hidden_size} (shared MLP)")
         print(f"  MarkovHead:  {self.hidden_size}×2→{self.hidden_size}→V")
         print(f"  Confidence:  {self.hidden_size}→128→{self.num_drafts} sigmoid")
