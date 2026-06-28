@@ -29,7 +29,7 @@ class TrainConfig:
     # Training
     batch_size: int = 4
     grad_acc_steps: int = 8       # effective batch = 4 × 8 = 32
-    max_steps: int = 5000
+    max_steps: int = 1000
     warmup_steps: int = 200
     lr: float = 5e-4
     weight_decay: float = 1e-2
