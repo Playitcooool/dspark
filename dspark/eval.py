@@ -39,11 +39,11 @@ def _ensure_tokenizer(model_path: str):
 def _load_dataloader(tokenizer, cfg: EvalConfig):
     """Return a small validation DataLoader from wikitext-103-raw."""
     from torch.utils.data import DataLoader
-    from .train import TextStream, _collate, _ensure_wikitext
+    from .train import ParquetTextStream, _collate, _ensure_wikitext
 
-    _, valid_texts = _ensure_wikitext()
+    _, valid_path = _ensure_wikitext()
 
-    stream = TextStream(valid_texts, tokenizer, cfg.context_len, cfg.num_drafts)
+    stream = ParquetTextStream(valid_path, tokenizer, cfg.context_len, cfg.num_drafts)
     return DataLoader(stream, batch_size=cfg.batch_size, collate_fn=_collate)
 
 

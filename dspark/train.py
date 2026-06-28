@@ -57,15 +57,15 @@ WIKITEXT_CACHE = os.path.expanduser("~/.cache/dspark/wikitext-103-raw")
 _LOCAL_DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 
 
-def _ensure_wikitext() -> tuple[list[str], list[str]]:
-    """Load wikitext-103-raw parquet files.
+def _ensure_wikitext() -> tuple[str, str]:
+    """Locate wikitext-103-raw parquet files, downloading if needed.
 
     Checks in order:
-      1. ``data/`` (project-relative) for raw shard files
+      1. ``data/`` (project-relative) for raw shard files (merges to cache)
       2. ``~/.cache/dspark/wikitext-103-raw/`` for merged parquet files
       3. Downloads from HF Hub (via HF_ENDPOINT) if neither found
 
-    Returns (train_texts, valid_texts) — lists of article strings.
+    Returns (train_path, valid_path) — paths to merged parquet files.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -131,64 +131,50 @@ def _ensure_wikitext() -> tuple[list[str], list[str]]:
         os.rename(os.path.join(tmpdir, "valid.parquet"), valid_path)
         shutil.rmtree(tmpdir)
 
-    def _load_articles(path: str) -> list[str]:
-        table = pq.read_table(path, columns=["text"])
-        texts = table.column("text").to_pylist()
-        articles, buf = [], []
-        for t in texts:
-            if t is None:
-                continue
-            t = t.strip()
-            if t.startswith(" ="):
-                if buf:
-                    articles.append("".join(buf))
-                    buf = []
-                continue
-            if t:
-                buf.append(t + "\n")
-        if buf:
-            articles.append("".join(buf))
-        return articles
-
-    return _load_articles(train_path), _load_articles(valid_path)
+    return train_path, valid_path
 
 
-class TextStream(IterableDataset):
-    """Stream text chunks from a list of strings."""
+class ParquetTextStream(IterableDataset):
+    """Stream wikitext chunks lazily from a parquet file — no preloading."""
 
-    def __init__(self, texts, tokenizer, context_len: int,
+    def __init__(self, path, tokenizer, context_len: int,
                  num_drafts: int):
-        self.texts = texts
+        self.path = path
         self.tokenizer = tokenizer
         self.context_len = context_len
-        self.full_len = context_len + num_drafts  # T+N
+        self.full_len = context_len + num_drafts
         self._buffer: list[int] = []
 
     def __iter__(self):
+        import pyarrow.parquet as pq
         acc = self._buffer.copy()
-        for text in self.texts:
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
-            acc.extend(ids)
-            while len(acc) >= self.full_len:
-                chunk = acc[:self.full_len]
-                yield {"input_ids": chunk[:self.context_len],
-                       "labels": chunk}
-                acc = acc[self.context_len:]
+        pf = pq.ParquetFile(self.path)
+        for batch in pf.iter_batches(batch_size=1024, columns=["text"]):
+            for text in batch.column("text").to_pylist():
+                if text is None:
+                    continue
+                ids = self.tokenizer.encode(text, add_special_tokens=False)
+                acc.extend(ids)
+                while len(acc) >= self.full_len:
+                    chunk = acc[:self.full_len]
+                    yield {"input_ids": chunk[:self.context_len],
+                           "labels": chunk}
+                    acc = acc[self.context_len:]
         self._buffer = acc
 
 
 def get_dataloaders(tokenizer, cfg: TrainConfig):
     """Return (train_loader, valid_loader) from wikitext-103-raw."""
-    print("Loading wikitext-103-raw …")
-    train_texts, valid_texts = _ensure_wikitext()
-    print(f"  train: {len(train_texts)} articles,  valid: {len(valid_texts)} articles")
-
-    def _make_loader(texts):
-        ds = TextStream(texts, tokenizer, cfg.context_len, cfg.num_drafts)
-        return DataLoader(ds, batch_size=cfg.batch_size,
-                          collate_fn=_collate)
-
-    return _make_loader(train_texts), _make_loader(valid_texts)
+    print("Locating wikitext-103-raw …")
+    train_path, valid_path = _ensure_wikitext()
+    train_ds = ParquetTextStream(train_path, tokenizer,
+                                  cfg.context_len, cfg.num_drafts)
+    valid_ds = ParquetTextStream(valid_path, tokenizer,
+                                  cfg.context_len, cfg.num_drafts)
+    return (
+        DataLoader(train_ds, batch_size=cfg.batch_size, collate_fn=_collate),
+        DataLoader(valid_ds, batch_size=cfg.batch_size, collate_fn=_collate),
+    )
 
 
 def _collate(batch):
