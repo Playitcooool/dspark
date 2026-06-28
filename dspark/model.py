@@ -331,32 +331,56 @@ class DSparkModel(nn.Module):
         )
         last_hidden = out.hidden_states[-1][:, -1, :]  # (B, H)
 
-        # -- step 1: parallel draft (no markov bias) ---------------------------
-        draft_h = self.draft_heads(last_hidden)          # (B, N, H)
-        draft_logits = self._vocab_proj(draft_h)          # (B, N, V)
+        # -- DDIM sampling loop ------------------------------------------------
+        K = self.num_diff_steps
+        device = input_ids.device
+        B = input_ids.shape[0]
+        N = self.num_drafts
 
-        # Greedy decode full draft (needed for markov bias pairs)
-        if temperature <= 0.0:
-            draft_tokens = draft_logits.argmax(dim=-1)   # (B, N)
-        else:
-            draft_tokens = torch.multinomial(
-                F.softmax(draft_logits.float() / temperature, dim=-1)
-                .view(-1, self.vocab_size), 1).view(B, N)
+        # 1. Pick K evenly-spaced noise levels (1000 -> 1)
+        steps = torch.linspace(1000, 1, K + 1, device=device,
+                               dtype=torch.long)[:-1]  # (K,) descending
+        alphas = self.noise_schedule.alpha(steps)        # (K,)
 
-        # -- step 2: markov bias from greedy token pairs -----------------------
-        # Context: [x_{T-1}, x_T^, x_{T+1}^, …, x_{T+N-1}^]
-        # The ^ denotes greedy-decoded draft tokens.
-        all_tokens = torch.cat([input_ids[:, -1:], draft_tokens], dim=1)  # (B,N+1)
-        prev_ids = all_tokens[:, :-1]    # (B, N)
-        cur_ids = all_tokens[:, 1:]      # (B, N)
-        markov_bias_h = self.markov_head(self.embed(prev_ids),
-                                         self.embed(cur_ids))  # (B, N, H)
+        # 2. Initialise from uniform noise
+        tokens = torch.randint(0, self.vocab_size, (B, N), device=device)
+        noisy_h = self.embed(tokens)  # (B, N, H)
 
-        # -- final logits ------------------------------------------------------
-        final_logits = self._vocab_proj(draft_h + markov_bias_h)  # (B, N, V)
+        for i in range(K):
+            # a. Timestep encoding
+            t_enc = self.time_proj(steps[i].expand(B))  # (B, H)
 
-        # -- confidence --------------------------------------------------------
-        accept_probs = self.confidence_head(last_hidden)  # (B, N)
+            # b. Denoise
+            clean_h = self.diff_draft_head(noisy_h, last_hidden, t_enc)
+
+            # c. Greedy-decode tokens for MarkovHead pairs
+            raw_logits = self._vocab_proj(clean_h)
+            greedy_tokens = raw_logits.argmax(dim=-1)
+
+            # d. MarkovHead bias from greedy token pairs
+            all_toks = torch.cat([input_ids[:, -1:], greedy_tokens], dim=1)
+            prev_ids = all_toks[:, :-1]
+            cur_ids = all_toks[:, 1:]
+            markov_bias_h = self.markov_head(self.embed(prev_ids),
+                                             self.embed(cur_ids))
+
+            # e. Final logits
+            logits_i = self._vocab_proj(clean_h + markov_bias_h)
+
+            # f. DDIM step (except the last -- use final as output)
+            if i < K - 1:
+                p0 = F.softmax(logits_i.float(), dim=-1)
+                a_next = alphas[i + 1]
+                next_dist = a_next * p0 + (1.0 - a_next) / self.vocab_size
+                tokens = torch.multinomial(
+                    next_dist.view(-1, self.vocab_size), 1).view(B, N)
+                noisy_h = self.embed(tokens)
+            else:
+                final_logits = logits_i
+                draft_tokens = greedy_tokens
+
+        # -- confidence (unchanged) -------------------------------------------
+        accept_probs = self.confidence_head(last_hidden)
 
         return draft_tokens, accept_probs, final_logits
 
