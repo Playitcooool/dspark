@@ -79,28 +79,12 @@ def eval_perplexity(model: DSparkModel, dataloader, cfg: EvalConfig):
         ).item()
         count += (T - 1) * B
 
-        # ── DSpark → first-draft-position perplexity ─────────────────────────
-        # Get last hidden state from base model
-        hs = model.base_model(input_ids, output_hidden_states=True).hidden_states[-1]
-        last_h = hs[:, -1, :]  # (B, H)
-
-        # Draft head 0
-        dh0 = model.draft_heads.adapters[0](last_h)  # (B, H)
-        # Markov bias for position 0: prev = last context token
-        prev_emb = model.embed(input_ids[:, -1:])  # (B, 1, H)
-        # For position 0, we don't know the cur token yet during inference.
-        # Use the greedy token as a stand-in.
-        raw_logits_0 = model._vocab_proj(dh0.unsqueeze(1))  # (B, 1, V)
-        greedy_token = raw_logits_0.argmax(dim=-1)  # (B, 1)
-        cur_emb = model.embed(greedy_token)  # (B, 1, H)
-        markov_h = model.markov_head(prev_emb, cur_emb)  # (B, 1, H)
-        final_l0 = model._vocab_proj(dh0.unsqueeze(1) + markov_h)  # (B, 1, V)
-
-        # Compare with ground truth at position T
-        gt = labels[:, T:T + 1]  # (B, 1)
+        # ── DSpark perplexity via draft_predict ────────────────────────────
+        _, _, draft_logits = model.draft_predict(input_ids)
+        # draft_logits: (B, N, V) — take position 0
         dspark_nll += F.cross_entropy(
-            final_l0.reshape(-1, model.vocab_size),
-            gt.reshape(-1),
+            draft_logits[:, 0, :].reshape(-1, model.vocab_size),
+            labels[:, T].reshape(-1),
             reduction="sum",
         ).item()
 
@@ -134,16 +118,8 @@ def eval_acceptance(model: DSparkModel, dataloader, cfg: EvalConfig):
         full_out = model.base_model(labels)
         base_at = full_out.logits[:, T - 1:T - 1 + cfg.num_drafts, :]  # (B, N, V)
 
-        # Get draft logits
-        hs = model.base_model(input_ids, output_hidden_states=True).hidden_states[-1]
-        last_h = hs[:, -1, :]
-        dh = model.draft_heads(last_h)  # (B, N, H)
-
-        # Markov bias (using ground truth — evaluation mode)
-        prev_ids = torch.cat([input_ids[:, -1:], labels[:, T:T + cfg.num_drafts - 1]], dim=1)
-        cur_ids = labels[:, T:T + cfg.num_drafts]
-        mb = model.markov_head(model.embed(prev_ids), model.embed(cur_ids))
-        draft_logits = model._vocab_proj(dh + mb)  # (B, N, V)
+        # Get draft logits from diffusion inference
+        _, _, draft_logits = model.draft_predict(input_ids)
 
         # Acceptance = sum_v min(draft_softmax(v), base_softmax(v))
         dp = F.softmax(draft_logits.float(), dim=-1)
