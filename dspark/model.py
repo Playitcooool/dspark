@@ -219,8 +219,7 @@ class DSparkModel(nn.Module):
                     ``accept_targets``.
         Returns:
             dict with keys:
-              draft_hidden   (B, N, H)
-              logits         (B, N, V)  — draft_logits + markov_bias
+              logits         (B, N, V)  — clean_logits + markov_bias
               accept_probs   (B, N)
               accept_targets (B, N)     — only when *labels* is given
         """
@@ -251,29 +250,50 @@ class DSparkModel(nn.Module):
                 last_hidden = out.hidden_states[-1][:, -1, :]      # (B, H)
                 base_at_draft = None
 
-        # 2. Draft heads  (fully parallel)
-        draft_hidden = self.draft_heads(last_hidden)  # (B, N, H)
-
-        # 3. Markov bias  (training: ground-truth pairs)
+        # 2. Diffusion: corrupt ground-truth tokens → denoise → predict
         if has_labels:
-            #   prev_ids = [x_{T-1}, x_T,    …, x_{T+N-2}]   (B, N)
-            #   cur_ids  = [x_T,     x_{T+1}, …, x_{T+N-1}]   (B, N)
-            prev_ids = torch.cat([input_ids[:, -1:],
-                                  labels[:, T:T + N - 1]], dim=1)   # (B, N)
-            cur_ids = labels[:, T:T + N]                              # (B, N)
-            markov_bias_h = self.markov_head(self.embed(prev_ids),
-                                             self.embed(cur_ids))     # (B, N, H)
+            y0 = labels[:, T:T + N]                      # (B, N) ground-truth
+            t = torch.randint(1, 1001, (B,),
+                              device=input_ids.device)   # (B,) per-batch timestep
+            alpha = self.noise_schedule.alpha(t)          # (B,)
+
+            # Forward corruption: each token kept w.p. α(t), else uniform random
+            keep = torch.rand(B, N, device=input_ids.device) < alpha.unsqueeze(1)
+            rand = torch.randint(0, self.vocab_size, (B, N),
+                                 device=input_ids.device)
+            noisy_tokens = torch.where(keep, y0, rand)
+
+            noisy_embed = self.embed(noisy_tokens)       # (B, N, H)
+            t_enc = self.time_proj(t)                     # (B, H)
+            clean_h = self.diff_draft_head(noisy_embed,
+                                           last_hidden, t_enc)  # (B, N, H)
         else:
-            markov_bias_h = 0.0
+            # Fallback (no labels — shouldn't happen in training)
+            clean_h = self.diff_draft_head(
+                self.embed(torch.zeros(B, N, dtype=torch.long,
+                                       device=input_ids.device)),
+                last_hidden,
+                self.time_proj(torch.zeros(B, dtype=torch.long,
+                                           device=input_ids.device)))
+
+        # 3. Markov bias (training: ground-truth token pairs)
+        if has_labels:
+            prev_ids = torch.cat([input_ids[:, -1:],
+                                  labels[:, T:T + N - 1]], dim=1)
+            cur_ids = labels[:, T:T + N]
+            markov_bias_h = self.markov_head(self.embed(prev_ids),
+                                             self.embed(cur_ids))
+        else:
+            markov_bias_h = torch.zeros(B, N, self.hidden_size,
+                                          device=input_ids.device)
 
         # 4. Final logits
-        logits = self._vocab_proj(draft_hidden + markov_bias_h)  # (B, N, V)
+        logits = self._vocab_proj(clean_h + markov_bias_h)
 
         # 5. Confidence head
         accept_probs = self.confidence_head(last_hidden)  # (B, N)
 
-        result = dict(draft_hidden=draft_hidden, logits=logits,
-                      accept_probs=accept_probs)
+        result = dict(logits=logits, accept_probs=accept_probs)
 
         # 6. Acceptance targets  (expected P(accept) under speculative decoding)
         if has_labels and base_at_draft is not None:
