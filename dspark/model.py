@@ -13,6 +13,8 @@ Training uses ground-truth labels for the Markov bias pairs.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +22,61 @@ from transformers import AutoModelForCausalLM
 
 
 # ════════════════════════════════════════════════════════ components
+
+
+class NoiseSchedule:
+    """Cosine noise schedule for multinomial diffusion.
+
+    α(t) = cos²( (t/T + s) / (1 + s) · π/2 )  ︱  α(0) ≡ 1
+    """
+    def __init__(self, T: int = 1000, s: float = 0.008):
+        self.T = T
+        self.s = s
+        self._f0 = math.cos((s / (1.0 + s)) * (math.pi / 2.0)) ** 2
+
+    def alpha(self, t: torch.Tensor) -> torch.Tensor:
+        """Return α(t) for integer timesteps t ∈ [0, T].
+
+        t can be a scalar, 1D tensor, or any shape — output matches.
+        """
+        x = (t.float() / self.T + self.s) / (1.0 + self.s)
+        return torch.cos(x * (math.pi / 2.0)) ** 2 / self._f0
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.alpha(t)
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal timestep encoding (same as Transformer position encoding)."""
+    def __init__(self, hidden_size: int, max_period: int = 10000):
+        super().__init__()
+        self.hidden_size = hidden_size
+        half = hidden_size // 2
+        freqs = torch.exp(-math.log(max_period)
+                          * torch.arange(0, half, dtype=torch.float) / half)
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, t: torch.LongTensor) -> torch.Tensor:
+        """t: (B,) timesteps → (B, hidden_size) encoding."""
+        emb = t.unsqueeze(-1).float() * self.freqs.unsqueeze(0)  # (B, half)
+        enc = torch.cat([emb.sin(), emb.cos()], dim=-1)           # (B, half*2)
+        if self.hidden_size % 2 != 0:
+            enc = torch.cat([enc, torch.zeros_like(enc[:, :1])], dim=-1)
+        return enc
+
+
+class TimeProjection(nn.Module):
+    """Map sinusoidal timestep encoding → (B, H)."""
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.embed = SinusoidalTimeEmbedding(hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+        )
+
+    def forward(self, t: torch.LongTensor) -> torch.Tensor:
+        return self.mlp(self.embed(t))  # (B, H)
 
 
 class DraftHeads(nn.Module):
