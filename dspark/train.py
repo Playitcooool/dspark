@@ -24,6 +24,7 @@ class TrainConfig:
 
     # Architecture
     num_drafts: int = 5
+    num_diff_steps: int = 8
     context_len: int = 512        # T — base model context window
 
     # Training
