@@ -64,7 +64,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         enc = torch.cat([emb.sin(), emb.cos()], dim=-1)           # (B, half*2)
         if self.hidden_size % 2 != 0:
             enc = torch.cat([enc, torch.zeros_like(enc[:, :1])], dim=-1)
-        return enc
+        return enc.to(self.freqs.dtype)
 
 
 class TimeProjection(nn.Module):
